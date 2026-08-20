@@ -1,0 +1,33 @@
+#!/bin/sh
+# Testing aid: polls the system volume and the backlight, and shows the overlay
+# whenever either one moves.  Nothing on the system is modified, so this is the
+# quickest way to try the overlay with the real volume keys:
+#
+#     knulli-overlay-watch &        # then press the volume keys
+#
+# The shipped integration will instead be a direct call from
+# /usr/bin/volume-button, which costs nothing between key presses -- see
+# install-test-hooks.sh.
+
+INTERVAL="${OV_WATCH_INTERVAL:-0.25}"
+
+vol_now()  { knulli-audio getSystemVolume 2>/dev/null; }
+bri_now()  { knulli-brightness 2>/dev/null; }
+
+last_vol=$(vol_now)
+last_bri=$(bri_now)
+
+while true; do
+    vol=$(vol_now)
+    bri=$(bri_now)
+
+    if [ -n "$vol" ] && [ "$vol" != "$last_vol" ]; then
+        knulli-overlay volume "$vol"
+        last_vol="$vol"
+    elif [ -n "$bri" ] && [ "$bri" != "$last_bri" ]; then
+        knulli-overlay brightness "$bri"
+        last_bri="$bri"
+    fi
+
+    sleep "$INTERVAL"
+done

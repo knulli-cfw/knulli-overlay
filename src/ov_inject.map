@@ -1,0 +1,12 @@
+/* Only the interposed EGL entry points are exported: anything else would risk
+ * hijacking a symbol lookup inside the host process. */
+{
+    global:
+        eglSwapBuffers;
+        eglSwapBuffersWithDamageKHR;
+        eglSwapBuffersWithDamageEXT;
+        eglGetProcAddress;
+        SDL_GL_SwapWindow;
+    local:
+        *;
+};
