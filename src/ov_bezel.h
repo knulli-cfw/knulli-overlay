@@ -10,7 +10,9 @@
  *     background_alpha=0
  *
  * so the injected library reads that file itself and nothing has to be wired
- * into the launcher.  The sibling .info file, when there is one, gives the
+ * into the launcher.  The path comes from $MANGOHUD_CONFIGFILE, which
+ * configgen sets for exactly the launches that get a bezel: the file it points
+ * at outlives the game, so a game started without one must not read it.  The sibling .info file, when there is one, gives the
  * geometry the image was cut for.
  */
 #ifndef OV_BEZEL_H
@@ -20,7 +22,6 @@
 
 #include "ov_png.h"
 
-#define OV_HUD_CONFIG_DEFAULT "/var/run/hud.config"
 #define OV_BEZEL_PATH_MAX 512
 
 typedef struct {
@@ -30,6 +31,10 @@ typedef struct {
     int      stretch;           /* fill the screen rather than fit it */
     int      info_w, info_h;    /* geometry the .info describes, 0 when none */
     int      top, left, bottom, right;  /* game window inside that geometry */
+    /* The fully transparent rectangle in the middle, as u0, v0, u1, v1 in
+     * 0..1 -- all zero when the image has none.  Drawing the frame around it
+     * instead of one quad over everything is what keeps a bezel cheap. */
+    float    hole[4];
 
     unsigned gen;               /* bumped whenever the image changes */
 

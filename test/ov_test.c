@@ -133,7 +133,7 @@ int main(int argc, char **argv)
         ov_gl_set_image(gl, bezel.img.rgba, bezel.img.w, bezel.img.h,
                         bezel.gen);
         ov_bezel_rect(&bezel, w, h, &bx, &by, &bw, &bh);
-        ov_layout_add_image(&dl, bx, by, bw, bh, bezel.opacity);
+        ov_layout_add_image(&dl, bx, by, bw, bh, bezel.opacity, bezel.hole);
         printf("bezel: %s %dx%d at %.0f,%.0f %.0fx%.0f alpha %.2f\n",
                bezel.path, bezel.img.w, bezel.img.h, bx, by, bw, bh,
                bezel.opacity);

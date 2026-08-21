@@ -232,6 +232,9 @@ struct ov_gl {
     GLint u_rect, u_screen, u_uv, u_rot;
     GLint u_half, u_radius, u_border, u_fill, u_stroke, u_mode, u_tex;
     int use_red;      /* single channel texture is GL_RED rather than GL_ALPHA */
+    /* $OV_NO_DRAW keeps every state change and skips the geometry, which tells
+     * a problem with what we draw from one with the state we leave behind. */
+    int no_draw;
     int have_vao;
     int ok;
 };
@@ -472,8 +475,9 @@ static int build_texture(struct ov_gl *g)
     GLenum format = g->use_red ? GL_RED : GL_ALPHA;
 
     g->gl.GenTextures(1, &g->tex);
+    g->gl.ActiveTexture(GL_TEXTURE0);
     g->gl.BindTexture(GL_TEXTURE_2D, g->tex);
-    g->gl.PixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    g->gl.PixelStorei(GL_UNPACK_ALIGNMENT, 1);   /* put back by the caller */
     g->gl.TexImage2D(GL_TEXTURE_2D, 0, internal, OV_ATLAS_W, OV_ATLAS_H, 0,
                      format, GL_UNSIGNED_BYTE, ov_atlas_pixels);
     g->gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -533,9 +537,42 @@ unsigned ov_gl_image_gen(const ov_gl *g)
     return g ? g->img_gen : 0;
 }
 
+/* Building the program and the atlas binds a buffer and a texture, and sets
+ * the unpack alignment.  This happens once, in the middle of somebody else's
+ * frame, so all of it has to be put back:  SDL's renderer keeps a software
+ * cache of what it thinks is bound and skips redundant binds, so a texture
+ * left bound here is a texture SDL draws its whole scene with. */
+struct create_saved {
+    GLint active_texture, texture0, array_buffer, unpack_alignment, vao;
+};
+
+static void save_for_create(struct ov_gl *g, struct create_saved *s)
+{
+    s->vao = 0;
+    if (g->have_vao)
+        g->gl.GetIntegerv(GL_VERTEX_ARRAY_BINDING, &s->vao);
+    g->gl.GetIntegerv(GL_ACTIVE_TEXTURE, &s->active_texture);
+    g->gl.ActiveTexture(GL_TEXTURE0);
+    g->gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &s->texture0);
+    g->gl.GetIntegerv(GL_ARRAY_BUFFER_BINDING, &s->array_buffer);
+    g->gl.GetIntegerv(GL_UNPACK_ALIGNMENT, &s->unpack_alignment);
+}
+
+static void restore_after_create(struct ov_gl *g, const struct create_saved *s)
+{
+    if (g->have_vao)
+        g->gl.BindVertexArray((GLuint)s->vao);
+    g->gl.PixelStorei(GL_UNPACK_ALIGNMENT, s->unpack_alignment);
+    g->gl.BindBuffer(GL_ARRAY_BUFFER, (GLuint)s->array_buffer);
+    g->gl.BindTexture(GL_TEXTURE_2D, (GLuint)s->texture0);
+    g->gl.ActiveTexture((GLenum)s->active_texture);
+}
+
 ov_gl *ov_gl_create(ov_getproc getproc)
 {
     struct ov_gl *g = calloc(1, sizeof(*g));   /* getproc NULL: built-in */
+    struct create_saved saved;
+    int ok;
 
     if (!g)
         return NULL;
@@ -544,25 +581,22 @@ ov_gl *ov_gl_create(ov_getproc getproc)
         return NULL;
     }
 
+    save_for_create(g, &saved);
     if (g->have_vao) {
         /* A core profile refuses to draw without one; harmless elsewhere. */
-        GLint prev = 0;
-        g->gl.GetIntegerv(GL_VERTEX_ARRAY_BINDING, &prev);
         g->gl.GenVertexArrays(1, &g->vao);
         g->gl.BindVertexArray(g->vao);
-        if (!build_program(g) || !build_texture(g)) {
-            g->gl.BindVertexArray((GLuint)prev);
-            ov_gl_destroy(g);
-            return NULL;
-        }
-        g->gl.BindVertexArray((GLuint)prev);
-    } else if (!build_program(g) || !build_texture(g)) {
+    }
+    ok = build_program(g) && build_texture(g);
+    restore_after_create(g, &saved);
+    if (!ok) {
         ov_gl_destroy(g);
         return NULL;
     }
 
     while (g->gl.GetError() != GL_NO_ERROR)
         ;               /* swallow anything our setup produced */
+    g->no_draw = getenv("OV_NO_DRAW") != NULL;
     g->ok = 1;
     return g;
 }
@@ -712,7 +746,7 @@ void ov_gl_draw(ov_gl *g, const ov_drawlist *dl, int w, int h, int rotation)
     gl->Uniform2f(g->u_screen, (GLfloat)w, (GLfloat)h);
     gl->Uniform1i(g->u_rot, rotation & 3);
 
-    for (i = 0; i < dl->count; i++) {
+    for (i = 0; i < dl->count && !g->no_draw; i++) {
         const ov_cmd *c = &dl->cmd[i];
         GLfloat rect[4] = { c->x, c->y, c->w, c->h };
         GLfloat uv[4] = { 0, 0, 0, 0 };
@@ -722,7 +756,10 @@ void ov_gl_draw(ov_gl *g, const ov_drawlist *dl, int w, int h, int rotation)
         if (c->image && !g->img_tex)
             continue;               /* nothing uploaded yet */
         if (c->image) {
-            uv[2] = uv[3] = 1.0f;   /* the whole image */
+            uv[0] = c->uv[0];
+            uv[1] = c->uv[1];
+            uv[2] = c->uv[2];
+            uv[3] = c->uv[3];
             mode = 2;
         } else {
             mode = c->glyph >= 0 ? 1 : 0;

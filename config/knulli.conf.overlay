@@ -1,0 +1,31 @@
+# ------------ Overlay ------------ #
+## Status overlay: volume, brightness, battery, wifi/bluetooth, clock, bezels.
+## These keys live in /userdata/system/knulli.conf; see the knulli-overlay
+## README for what each one does, and `knulli-overlay config` for what the
+## file currently resolves to.
+
+overlay.enabled=1
+overlay.invert=0
+overlay.fgcolor=000000
+overlay.bgcolor=ffffff
+overlay.alpha=92
+overlay.scale=1.0
+
+## left|center|right and top|middle|bottom, in either order.
+overlay.volume.position=left-middle
+overlay.brightness.position=left-middle
+overlay.battery.position=top-right
+overlay.clock.position=top-left
+overlay.notification.position=bottom-center
+
+overlay.battery.percent=1
+overlay.wifi.show=1
+overlay.bluetooth.show=1
+
+overlay.clock.show=0
+overlay.clock.format=24
+overlay.clock.always=1
+
+overlay.bezel.enabled=1
+overlay.bezel.stretch=0
+#overlay.bezel.alpha=100

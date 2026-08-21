@@ -45,15 +45,27 @@ OUTDIR ?= build/$(if $(BOARD),$(BOARD),host)
 
 LIB     = $(OUTDIR)/libknulli-overlay.so
 BIN     = $(OUTDIR)/knulli-overlay
+VKLAYER = $(OUTDIR)/libVkLayer_knulli_overlay.so
 # The library reads hud.config and decodes the bezel PNG itself (ov_png), so a
 # game process still needs nothing but libc.
-LIB_SRC = src/ov_inject.c src/ov_gl.c src/ov_layout.c src/ov_state.c \
-          src/ov_anchor.c src/ov_atlas.c src/ov_bezel.c src/ov_png.c \
-          src/ov_inflate.c src/ov_config.c
+COMMON_SRC = src/ov_frame.c src/ov_layout.c src/ov_state.c src/ov_anchor.c \
+             src/ov_atlas.c src/ov_bezel.c src/ov_png.c src/ov_inflate.c \
+             src/ov_config.c
+LIB_SRC = src/ov_inject.c src/ov_gl.c $(COMMON_SRC)
 BIN_SRC = src/ov_ctl.c src/ov_state.c src/ov_battery.c src/ov_config.c \
           src/ov_anchor.c src/ov_bezel.c src/ov_png.c src/ov_inflate.c
 
-all: $(LIB) $(BIN)
+VKLAYER_SRC = src/ov_vk_layer.c src/ov_vk.c $(COMMON_SRC)
+
+# The layer needs the Vulkan headers.  A build host usually has none, and the
+# rest of the overlay does not care, so it is built where they exist.
+HAVE_VULKAN := $(shell $(CC) -E -include vulkan/vulkan.h -x c /dev/null \
+                 > /dev/null 2>&1 && echo yes)
+
+all: $(LIB) $(BIN) $(if $(HAVE_VULKAN),$(VKLAYER))
+ifneq ($(HAVE_VULKAN),yes)
+	@echo "note: no vulkan headers for $(CC), skipping the Vulkan layer"
+endif
 
 $(OUTDIR):
 	mkdir -p $@
@@ -67,21 +79,46 @@ $(LIB): $(LIB_SRC) src/ov_atlas.h src/ov_inject.map | $(OUTDIR)
 $(BIN): $(BIN_SRC) src/ov_state.h src/ov_battery.h | $(OUTDIR)
 	$(CC) $(CFLAGS) -o $@ $(BIN_SRC) $(LDFLAGS)
 
+# The Vulkan layer needs the headers but never links the loader: the loader
+# hands a layer its function pointers.
+$(VKLAYER): $(VKLAYER_SRC) src/ov_vk.h src/ov_vk_spv.h | $(OUTDIR)
+	$(CC) $(CFLAGS) -fPIC -shared -o $@ $(VKLAYER_SRC) $(LDFLAGS) -lpthread -lm
+
 # ov_test renders the panel offscreen; ov_app fakes a game and checks that the
 # injection leaves the GL state alone.  Both run on the host and on the device.
-test: $(OUTDIR)/ov_test $(OUTDIR)/ov_app
+# A buildroot output ships its own pkg-config, already pointed at the sysroot.
+PKG_CONFIG  ?= $(if $(BOARD),$(KNULLI_OUTPUT)/host/bin/pkg-config,pkg-config)
+SDL_CFLAGS  ?= $(shell $(PKG_CONFIG) --cflags sdl2 2>/dev/null)
+SDL_LIBS    ?= $(shell $(PKG_CONFIG) --libs sdl2 2>/dev/null || echo -lSDL2)
+
+# ov_sdl is built only where SDL2 exists; the rest of the checks never need it.
+HAVE_SDL := $(shell $(PKG_CONFIG) --exists sdl2 2>/dev/null && echo yes)
+
+test: $(OUTDIR)/ov_test $(OUTDIR)/ov_app $(if $(HAVE_SDL),$(OUTDIR)/ov_sdl)
+ifneq ($(HAVE_SDL),yes)
+	@echo "note: no sdl2 found by $(PKG_CONFIG), skipping ov_sdl"
+endif
 
 $(OUTDIR)/ov_test: test/ov_test.c src/ov_gl.c src/ov_layout.c src/ov_state.c \
                    src/ov_anchor.c src/ov_atlas.c src/ov_bezel.c src/ov_png.c \
                    src/ov_inflate.c src/ov_config.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(GL_LIBS) -lm
 
+# ov_sdl needs SDL2 itself, which the library never links -- it is the check
+# for the SDL_Renderer path (ScummVM, SDLPoP and friends).
+
+$(OUTDIR)/ov_sdl: test/ov_sdl.c | $(OUTDIR)
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -o $@ $< $(LDFLAGS) $(SDL_LIBS)
+
 $(OUTDIR)/ov_app: test/ov_app.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) $(GL_LIBS)
 
 install: all
-	install -D -m 0755 $(LIB) $(DESTDIR)$(PREFIX)/lib/$(LIB)
-	install -D -m 0755 $(BIN) $(DESTDIR)$(PREFIX)/bin/$(BIN)
+	install -D -m 0755 $(LIB) $(DESTDIR)$(PREFIX)/lib/$(notdir $(LIB))
+	install -D -m 0755 $(BIN) $(DESTDIR)$(PREFIX)/bin/$(notdir $(BIN))
+	install -D -m 0755 $(VKLAYER) $(DESTDIR)$(PREFIX)/lib/$(notdir $(VKLAYER))
+	install -D -m 0644 config/knulli_overlay_layer.json \
+	    $(DESTDIR)$(PREFIX)/share/vulkan/implicit_layer.d/knulli_overlay.json
 
 clean:
 	rm -rf build *.ppm

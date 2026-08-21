@@ -89,7 +89,15 @@ static int show_bezel(int argc, char **argv)
 
     ov_bezel_init(&bz);
     if (!ov_bezel_poll(&bz)) {
-        printf("bezel:       none\n");
+        /* Run from a shell there is normally no bezel to find: it is the
+         * game's environment that names one. */
+        const char *cfg = getenv("OV_HUD_CONFIG");
+
+        if (!cfg || !*cfg)
+            cfg = getenv("MANGOHUD_CONFIGFILE");
+        printf("bezel:       none (%s)\n",
+               (cfg && *cfg) ? "nothing named in that file"
+                             : "MANGOHUD_CONFIGFILE is not set");
         ov_bezel_free(&bz);
         return 0;
     }

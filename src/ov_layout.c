@@ -597,14 +597,14 @@ void ov_layout_reset(ov_drawlist *dl)
     dl->count = 0;
 }
 
-/* The bezel is a plain textured quad: no rounding, no border, and the tint is
- * white so only its alpha reaches the fragment. */
-void ov_layout_add_image(ov_drawlist *dl, float x, float y, float w, float h,
-                         float alpha)
+/* One piece of the image: a plain textured quad, no rounding, no border, tinted
+ * white so only its own colours and alpha reach the fragment. */
+static void add_image_part(ov_drawlist *dl, float x, float y, float w, float h,
+                           float u, float v, float du, float dv, float alpha)
 {
     ov_cmd *c;
 
-    if (dl->count >= OV_MAX_CMDS || w <= 0.0f || h <= 0.0f || alpha <= 0.0f)
+    if (dl->count >= OV_MAX_CMDS || w <= 0.5f || h <= 0.5f)
         return;
     c = &dl->cmd[dl->count++];
     memset(c, 0, sizeof(*c));
@@ -614,8 +614,42 @@ void ov_layout_add_image(ov_drawlist *dl, float x, float y, float w, float h,
     c->h = h;
     c->glyph = -1;
     c->image = 1;
+    c->uv[0] = u;
+    c->uv[1] = v;
+    c->uv[2] = du;
+    c->uv[3] = dv;
     c->fill[0] = c->fill[1] = c->fill[2] = 1.0f;
     c->fill[3] = alpha > 1.0f ? 1.0f : alpha;
+}
+
+void ov_layout_add_image(ov_drawlist *dl, float x, float y, float w, float h,
+                         float alpha, const float *hole)
+{
+    float hx0, hy0, hx1, hy1;
+
+    if (w <= 0.0f || h <= 0.0f || alpha <= 0.0f)
+        return;
+    if (!hole || hole[2] <= hole[0] || hole[3] <= hole[1]) {
+        add_image_part(dl, x, y, w, h, 0.0f, 0.0f, 1.0f, 1.0f, alpha);
+        return;
+    }
+
+    /* The hole in screen space; what is left is up to four strips around it,
+     * each with the matching piece of the image. */
+    hx0 = x + hole[0] * w;
+    hy0 = y + hole[1] * h;
+    hx1 = x + hole[2] * w;
+    hy1 = y + hole[3] * h;
+
+    add_image_part(dl, x, y, w, hy0 - y,
+                   0.0f, 0.0f, 1.0f, hole[1], alpha);                 /* top */
+    add_image_part(dl, x, hy1, w, y + h - hy1,
+                   0.0f, hole[3], 1.0f, 1.0f - hole[3], alpha);    /* bottom */
+    add_image_part(dl, x, hy0, hx0 - x, hy1 - hy0,
+                   0.0f, hole[1], hole[0], hole[3] - hole[1], alpha);/* left */
+    add_image_part(dl, hx1, hy0, x + w - hx1, hy1 - hy0,
+                   hole[2], hole[1], 1.0f - hole[2], hole[3] - hole[1],
+                   alpha);                                          /* right */
 }
 
 void ov_layout_build(ov_drawlist *dl, const ov_snapshot *snap,

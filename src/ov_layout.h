@@ -20,6 +20,7 @@ typedef struct {
     float stroke[4];      /* RGBA of the border */
     int   glyph;          /* atlas glyph index, or -1 for a rounded rect */
     int   image;          /* 1: draw the bezel texture, `fill` tinting it */
+    float uv[4];          /* image sub-rectangle: u, v, du, dv (image only) */
 } ov_cmd;
 
 typedef struct {
@@ -54,8 +55,14 @@ void ov_style_defaults(ov_style *st);   /* built-in values, then $OV_* overrides
 /* The drawing commands are appended, so a caller can put the bezel underneath
  * the widgets by adding it first. */
 void ov_layout_reset(ov_drawlist *dl);
+
+/* Adds an image.  `hole`, when not NULL, is a rectangle of the image that is
+ * fully transparent, as u0, v0, u1, v1 in 0..1: the image is then drawn as the
+ * frame around it rather than as one quad over the whole screen.  A bezel is
+ * mostly hole, and on a tile-based GPU the pixels not drawn are the ones that
+ * cost. */
 void ov_layout_add_image(ov_drawlist *dl, float x, float y, float w, float h,
-                         float alpha);
+                         float alpha, const float *hole);
 
 void ov_layout_build(ov_drawlist *dl, const ov_snapshot *snap,
                      const ov_style *st, int screen_w, int screen_h);

@@ -1,0 +1,14 @@
+{
+    "file_format_version": "1.2.0",
+    "layer": {
+        "name": "VK_LAYER_KNULLI_overlay",
+        "type": "GLOBAL",
+        "library_path": "/usr/lib/libVkLayer_knulli_overlay.so",
+        "api_version": "1.3.225",
+        "implementation_version": "1",
+        "description": "knulli status overlay: volume, brightness, battery, clock and bezels",
+        "disable_environment": {
+            "OV_DISABLE_VK_LAYER": "1"
+        }
+    }
+}
