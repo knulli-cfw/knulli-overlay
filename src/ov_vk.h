@@ -110,6 +110,10 @@ unsigned ov_vk_image_gen(const ov_vk *v);
 /* Which of the swapchain images this is, or -1 when it is not one of them. */
 int ov_vk_image_index(const ov_vk *v, VkImage image);
 
+/* Lets present sample one of the application's own images (see ov_vk_draw's
+ * blit_source).  Returns 0 if the image cannot be sampled. */
+int ov_vk_set_source(ov_vk *v, uint32_t index, VkImage image);
+
 /* Records and submits the overlay, waiting on the semaphores the application
  * meant to present with.  Returns the semaphore the caller must present with
  * instead, or VK_NULL_HANDLE when nothing was submitted and the present should
@@ -123,6 +127,7 @@ int ov_vk_image_index(const ov_vk *v, VkImage image);
  * command buffer and fence to use. */
 VkSemaphore ov_vk_draw(ov_vk *v, VkQueue queue, uint32_t index, VkImage target,
                        const ov_drawlist *dl, int rotation,
-                       const VkSemaphore *wait, uint32_t wait_count);
+                       const VkSemaphore *wait, uint32_t wait_count,
+                       int blit_source);
 
 #endif /* OV_VK_H_INCLUDED */

@@ -51,6 +51,14 @@ struct ov_vk {
     const void    *pending;         /* not yet uploaded, owned by the caller */
     int            pending_w, pending_h;
 
+    /* The application's own image for each swapchain image, when the layer is
+     * rotating the presentation: a view and a descriptor set so the shader can
+     * sample it as the full-screen source. */
+    int             rot_src;        /* quarter turns the source is turned by */
+    VkImage         src_image[OV_VK_MAX_IMAGES];
+    VkImageView     src_view[OV_VK_MAX_IMAGES];
+    VkDescriptorSet src_set[OV_VK_MAX_IMAGES];
+
     VkFormat format;
     /* Images that are not ours -- a layer above copying from its own shadow --
      * get a view and a framebuffer here the first time they turn up. */
@@ -204,11 +212,13 @@ static int make_descriptors(ov_vk *v)
 
     memset(&size, 0, sizeof(size));
     size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    size.descriptorCount = 2;
+    /* One set for the overlay itself, plus one per swapchain image for the
+     * rotate at present. */
+    size.descriptorCount = 2 * (1 + OV_VK_MAX_IMAGES);
 
     memset(&pi, 0, sizeof(pi));
     pi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pi.maxSets = 1;
+    pi.maxSets = 1 + OV_VK_MAX_IMAGES;
     pi.poolSizeCount = 1;
     pi.pPoolSizes = &size;
     if (v->fn->CreateDescriptorPool(v->device, &pi, NULL,
@@ -475,12 +485,15 @@ ov_vk *ov_vk_create(VkDevice device, const ov_vk_fns *fn,
 void ov_vk_destroy(ov_vk *v)
 {
     const ov_vk_fns *fn;
-    uint32_t i;
+    uint32_t i, si;
 
     if (!v)
         return;
     fn = v->fn;
     fn->DeviceWaitIdle(v->device);
+    for (si = 0; si < OV_VK_MAX_IMAGES; si++)
+        if (v->src_view[si])
+            fn->DestroyImageView(v->device, v->src_view[si], NULL);
     for (i = 0; i < v->count; i++) {
         if (v->frame[i].sem)
             fn->DestroySemaphore(v->device, v->frame[i].sem, NULL);
@@ -868,8 +881,14 @@ static int group_commands(const ov_vk *v, const ov_drawlist *dl, int rotation,
 static void dump_image(ov_vk *v, VkQueue queue, uint32_t index)
 {
     const char *path = getenv("OV_VK_DUMP");
+    /* $OV_VK_DUMP_SOURCE reads the image the application drew into rather than
+     * the one being presented, which is what tells a blit that went wrong from
+     * an application that never drew. */
+    int want_source = getenv("OV_VK_DUMP_SOURCE") != NULL;
+    VkImage dump_src;
+    uint32_t dump_w, dump_h;
     const ov_vk_fns *fn = v->fn;
-    VkDeviceSize size = (VkDeviceSize)v->extent.width * v->extent.height * 4;
+    VkDeviceSize size;
     VkBufferCreateInfo bi;
     VkMemoryRequirements req;
     VkMemoryAllocateInfo mi;
@@ -895,6 +914,19 @@ static void dump_image(ov_vk *v, VkQueue queue, uint32_t index)
     if (++v->drawn < v->dump_at)
         return;
     v->dumped = 1;
+
+    /* The source is the application's own image, which is its way round; the
+     * presented one is the panel's. */
+    dump_src = (want_source && index < OV_VK_MAX_IMAGES && v->src_image[index])
+               ? v->src_image[index] : v->frame[index].image;
+    if (dump_src != v->frame[index].image) {
+        dump_w = (v->rot_src & 1) ? v->extent.height : v->extent.width;
+        dump_h = (v->rot_src & 1) ? v->extent.width : v->extent.height;
+    } else {
+        dump_w = v->extent.width;
+        dump_h = v->extent.height;
+    }
+    size = (VkDeviceSize)dump_w * dump_h * 4;
 
     memset(&bi, 0, sizeof(bi));
     bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -935,7 +967,7 @@ static void dump_image(ov_vk *v, VkQueue queue, uint32_t index)
     bar.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     bar.srcQueueFamilyIndex = bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    bar.image = v->frame[index].image;
+    bar.image = dump_src;
     bar.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     bar.subresourceRange.levelCount = bar.subresourceRange.layerCount = 1;
     fn->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
@@ -945,10 +977,10 @@ static void dump_image(ov_vk *v, VkQueue queue, uint32_t index)
     memset(&copy, 0, sizeof(copy));
     copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     copy.imageSubresource.layerCount = 1;
-    copy.imageExtent.width = v->extent.width;
-    copy.imageExtent.height = v->extent.height;
+    copy.imageExtent.width = dump_w;
+    copy.imageExtent.height = dump_h;
     copy.imageExtent.depth = 1;
-    fn->CmdCopyImageToBuffer(cmd, v->frame[index].image,
+    fn->CmdCopyImageToBuffer(cmd, dump_src,
                              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1,
                              &copy);
 
@@ -978,8 +1010,10 @@ static void dump_image(ov_vk *v, VkQueue queue, uint32_t index)
         if (f) {
             fwrite(mapped, 1, (size_t)size, f);
             fclose(f);
-            vk_log("vulkan: wrote %s (%ux%u, 4 bytes per pixel)", path,
-                   v->extent.width, v->extent.height);
+            vk_log("vulkan: wrote %s (%ux%u, 4 bytes per pixel, %s image)",
+                   path, dump_w, dump_h,
+                   dump_src == v->frame[index].image ? "presented"
+                                                     : "application's own");
         }
         fn->UnmapMemory(v->device, mem);
     }
@@ -1054,11 +1088,72 @@ static VkFramebuffer aux_framebuffer(ov_vk *v, VkImage image)
     return v->aux[slot].fb;
 }
 
+/* Gives the shader a way to sample one of the application's images, so that
+ * present can turn it onto the real swapchain.  Done once per image, when the
+ * swapchain is created. */
+int ov_vk_set_source(ov_vk *v, uint32_t index, VkImage image)
+{
+    VkImageViewCreateInfo vi;
+    VkDescriptorSetAllocateInfo ai;
+    VkDescriptorImageInfo info[2];
+    VkWriteDescriptorSet write[2];
+    int i;
+
+    if (!v || !v->ok || index >= OV_VK_MAX_IMAGES)
+        return 0;
+    if (v->src_set[index])
+        return 1;
+
+    memset(&vi, 0, sizeof(vi));
+    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vi.image = image;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = v->format;
+    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    vi.subresourceRange.levelCount = 1;
+    vi.subresourceRange.layerCount = 1;
+    if (v->fn->CreateImageView(v->device, &vi, NULL, &v->src_view[index])
+            != VK_SUCCESS)
+        return 0;
+
+    memset(&ai, 0, sizeof(ai));
+    ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ai.descriptorPool = v->desc_pool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &v->set_layout;
+    if (v->fn->AllocateDescriptorSets(v->device, &ai, &v->src_set[index])
+            != VK_SUCCESS) {
+        v->src_set[index] = VK_NULL_HANDLE;
+        return 0;
+    }
+
+    memset(info, 0, sizeof(info));
+    info[0].sampler = v->sampler;
+    info[0].imageView = v->atlas_view;      /* binding 0 is never sampled here */
+    info[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    info[1] = info[0];
+    info[1].imageView = v->src_view[index];
+
+    memset(write, 0, sizeof(write));
+    for (i = 0; i < 2; i++) {
+        write[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write[i].dstSet = v->src_set[index];
+        write[i].dstBinding = (uint32_t)i;
+        write[i].descriptorCount = 1;
+        write[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write[i].pImageInfo = &info[i];
+    }
+    v->fn->UpdateDescriptorSets(v->device, 2, write, 0, NULL);
+    v->src_image[index] = image;
+    return 1;
+}
+
 /* The drawing itself, into whichever framebuffer and render pass the caller
  * has picked; shared by the two ways the overlay reaches the screen. */
 static void record_passes(ov_vk *v, VkCommandBuffer cmd, VkRenderPass pass,
                           VkFramebuffer fb, const ov_drawlist *dl,
-                          int rotation, VkImageMemoryBarrier *between)
+                          int rotation, VkImageMemoryBarrier *between,
+                          VkDescriptorSet source)
 {
     struct ov_vk_group group[OV_VK_MAX_GROUPS];
     unsigned char group_of[OV_MAX_CMDS];
@@ -1078,6 +1173,18 @@ static void record_passes(ov_vk *v, VkCommandBuffer cmd, VkRenderPass pass,
 
     groups = group_commands(v, dl, rotation, group, group_of,
                             OV_VK_MAX_GROUPS);
+
+    /* Turning the application's frame onto the panel covers everything, so the
+     * per-widget grouping that keeps a tiler cheap has nothing left to save:
+     * one pass over the whole screen, with the source drawn under the overlay. */
+    if (source) {
+        groups = 1;
+        group[0].area.offset.x = 0;
+        group[0].area.offset.y = 0;
+        group[0].area.extent = v->extent;
+        for (i = 0; i < (uint32_t)dl->count; i++)
+            group_of[i] = 0;
+    }
 
     memset(&viewport, 0, sizeof(viewport));
     viewport.width = (float)v->extent.width;
@@ -1103,6 +1210,31 @@ static void record_passes(ov_vk *v, VkCommandBuffer cmd, VkRenderPass pass,
                                   v->layout, 0, 1, &v->set, 0, NULL);
         fn->CmdSetViewport(cmd, 0, 1, &viewport);
         fn->CmdSetScissor(cmd, 0, 1, &scissor);
+
+        /* The application's frame, turned to match the panel.  Screen space is
+         * already the application's way round, so this is simply the whole of
+         * it; the shader's rot does the turning. */
+        if (source) {
+            fn->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                      v->layout, 0, 1, &source, 0, NULL);
+            memset(&push, 0, sizeof(push));
+            push.rect[2] = screen_w;
+            push.rect[3] = screen_h;
+            push.uv[2] = 1.0f;
+            push.uv[3] = 1.0f;
+            push.screen[0] = screen_w;
+            push.screen[1] = screen_h;
+            push.fill[0] = push.fill[1] = push.fill[2] = push.fill[3] = 1.0f;
+            push.mode = 2;
+            push.rot = rotation;
+            fn->CmdPushConstants(cmd, v->layout,
+                                 VK_SHADER_STAGE_VERTEX_BIT
+                                 | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                 0, sizeof(push), &push);
+            fn->CmdDraw(cmd, 4, 1, 0, 0);
+            fn->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                      v->layout, 0, 1, &v->set, 0, NULL);
+        }
 
         for (i = 0; i < (uint32_t)dl->count; i++) {
             const ov_cmd *c = &dl->cmd[i];
@@ -1157,8 +1289,10 @@ static void record_passes(ov_vk *v, VkCommandBuffer cmd, VkRenderPass pass,
 
 VkSemaphore ov_vk_draw(ov_vk *v, VkQueue queue, uint32_t index, VkImage target,
                        const ov_drawlist *dl, int rotation,
-                       const VkSemaphore *wait, uint32_t wait_count)
+                       const VkSemaphore *wait, uint32_t wait_count,
+                       int blit_source)
 {
+    VkDescriptorSet source = VK_NULL_HANDLE;
     VkFramebuffer fb;
     VkImage image;
     VkPipelineStageFlags stages[OV_VK_MAX_WAIT];
@@ -1170,7 +1304,12 @@ VkSemaphore ov_vk_draw(ov_vk *v, VkQueue queue, uint32_t index, VkImage target,
     uint32_t i;
     VkResult r;
 
-    if (!v || !v->ok || !dl || dl->count == 0 || index >= v->count) {
+    if (v && blit_source && index < OV_VK_MAX_IMAGES) {
+        source = v->src_set[index];
+        v->rot_src = rotation;
+    }
+    if (!v || !v->ok || !dl || (dl->count == 0 && !source)
+        || index >= v->count) {
         vk_log("vulkan: nothing to submit (ok %d, commands %d, index %u/%u)",
                v ? v->ok : -1, dl ? dl->count : -1, index, v ? v->count : 0);
         return VK_NULL_HANDLE;
@@ -1230,8 +1369,37 @@ VkSemaphore ov_vk_draw(ov_vk *v, VkQueue queue, uint32_t index, VkImage target,
                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
                            0, NULL, 0, NULL, 1, &barrier);
 
+    /* The application finished with its own image by handing it to present,
+     * so it is in PRESENT_SRC_KHR; sampling it needs it read-only, and the
+     * application gets it back the way it left it. */
+    if (source) {
+        VkImageMemoryBarrier src_bar = barrier;
+
+        src_bar.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        src_bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        src_bar.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        src_bar.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        src_bar.image = v->src_image[index];
+        fn->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                               0, NULL, 0, NULL, 1, &src_bar);
+    }
+
     barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    record_passes(v, cmd, v->pass, fb, dl, rotation, &barrier);
+    record_passes(v, cmd, v->pass, fb, dl, rotation, &barrier, source);
+
+    if (source) {
+        VkImageMemoryBarrier src_bar = barrier;
+
+        src_bar.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        src_bar.dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        src_bar.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        src_bar.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        src_bar.image = v->src_image[index];
+        fn->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                               0, NULL, 0, NULL, 1, &src_bar);
+    }
 
     if (fn->EndCommandBuffer(cmd) != VK_SUCCESS) {
         vk_log("vulkan: vkEndCommandBuffer failed");

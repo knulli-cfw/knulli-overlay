@@ -30,6 +30,10 @@ struct instance_data {
     PFN_vkGetInstanceProcAddr gpa;
     PFN_vkDestroyInstance     DestroyInstance;
     PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR
+                              GetPhysicalDeviceSurfaceCapabilitiesKHR;
+    PFN_vkGetDisplayModePropertiesKHR GetDisplayModePropertiesKHR;
+    PFN_vkCreateDisplayPlaneSurfaceKHR CreateDisplayPlaneSurfaceKHR;
     struct instance_data     *next;
 };
 
@@ -57,6 +61,14 @@ struct swapchain_data {
     VkExtent2D          extent;
     /* The private image a layer above copies from, per swapchain image. */
     VkImage             shadow[OV_VK_MAX_IMAGES];
+    /* Rotated presentation: the application draws into images of its own that
+     * we hand it, laid out the way round it thinks the screen is, and present
+     * turns them into the real swapchain.  Empty when not rotating. */
+    int                 rotated;
+    VkExtent2D          app_extent;
+    VkImage             owned[OV_VK_MAX_IMAGES];
+    VkDeviceMemory      owned_mem[OV_VK_MAX_IMAGES];
+    uint32_t            owned_count;
     struct swapchain_data *next;
 };
 
@@ -150,6 +162,58 @@ static struct instance_data  *g_instances;
 static struct device_data    *g_devices;
 static struct swapchain_data *g_swapchains;
 
+/* Quarter turns clockwise the presented image needs, 0..3.
+ *
+ * A panel mounted rotated cannot be turned by this driver -- KHR_display
+ * reports IDENTITY as its only supported transform -- and the application
+ * lays its whole world out, menus included, against the size the surface
+ * reports.  So the surface is reported turned, the application draws into
+ * images of that shape, and present rotates them onto the real swapchain.
+ * That is why this is done here rather than per application: it covers
+ * whatever the process draws, not just its emulated content.
+ *
+ * $OV_VK_ROTATE takes degrees (0, 90, 180, 270); unset means no rotation
+ * and the layer stays a pass-through. */
+static int rotate_quarters(void)
+{
+    static int cached = -1;
+    const char *env;
+
+    if (cached >= 0)
+        return cached;
+    cached = 0;
+    env = getenv("OV_VK_ROTATE");
+    if (env)
+        cached = (atoi(env) / 90) & 3;
+    if (cached)
+        ov_log("vulkan: presenting rotated by %d degrees", cached * 90);
+    return cached;
+}
+
+/* 90 and 270 swap width and height; 0 and 180 do not. */
+static VkExtent2D turned(VkExtent2D e, int quarters)
+{
+    VkExtent2D out = e;
+
+    if (quarters & 1) {
+        out.width = e.height;
+        out.height = e.width;
+    }
+    return out;
+}
+
+static int memory_type_for(const struct device_data *dd, uint32_t bits,
+                           VkMemoryPropertyFlags want)
+{
+    uint32_t i;
+
+    for (i = 0; i < dd->mem.memoryTypeCount; i++)
+        if ((bits & (1u << i)) &&
+            (dd->mem.memoryTypes[i].propertyFlags & want) == want)
+            return (int)i;
+    return -1;
+}
+
 static struct instance_data *find_instance(VkInstance i)
 {
     struct instance_data *d;
@@ -214,6 +278,15 @@ layer_CreateInstance(const VkInstanceCreateInfo *ci,
     id->instance = *out;
     id->gpa = gpa;
     id->DestroyInstance = (PFN_vkDestroyInstance)gpa(*out, "vkDestroyInstance");
+    id->GetPhysicalDeviceSurfaceCapabilitiesKHR =
+        (PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)
+        gpa(*out, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    id->GetDisplayModePropertiesKHR =
+        (PFN_vkGetDisplayModePropertiesKHR)
+        gpa(*out, "vkGetDisplayModePropertiesKHR");
+    id->CreateDisplayPlaneSurfaceKHR =
+        (PFN_vkCreateDisplayPlaneSurfaceKHR)
+        gpa(*out, "vkCreateDisplayPlaneSurfaceKHR");
     id->GetPhysicalDeviceMemoryProperties =
         (PFN_vkGetPhysicalDeviceMemoryProperties)
         gpa(*out, "vkGetPhysicalDeviceMemoryProperties");
@@ -336,6 +409,203 @@ layer_DestroyDevice(VkDevice device, const VkAllocationCallbacks *alloc)
 
 /* ------------------------------------------------------------------ */
 
+/* Reports the surface turned, so the application lays itself out -- menus,
+ * OSD and all -- for the screen as the player sees it rather than as the panel
+ * is wired.  The extent is the only thing changed; the real one is restored in
+ * CreateSwapchainKHR. */
+static VKAPI_ATTR VkResult VKAPI_CALL
+layer_GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice gpu,
+                                              VkSurfaceKHR surface,
+                                              VkSurfaceCapabilitiesKHR *caps)
+{
+    struct instance_data *id;
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR next = NULL;
+    int quarters = rotate_quarters();
+    VkResult r;
+
+    pthread_mutex_lock(&g_lock);
+    for (id = g_instances; id; id = id->next)
+        if (id->GetPhysicalDeviceSurfaceCapabilitiesKHR) {
+            next = id->GetPhysicalDeviceSurfaceCapabilitiesKHR;
+            break;
+        }
+    pthread_mutex_unlock(&g_lock);
+    if (!next)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    r = next(gpu, surface, caps);
+    if (r != VK_SUCCESS || !(quarters & 1))
+        return r;
+
+    caps->currentExtent = turned(caps->currentExtent, quarters);
+    caps->minImageExtent = turned(caps->minImageExtent, quarters);
+    caps->maxImageExtent = turned(caps->maxImageExtent, quarters);
+    return r;
+}
+
+/* An application that drives KHR_display itself -- PPSSPP does -- asks the
+ * display for its modes rather than asking the surface how big it is, so the
+ * lie in GetPhysicalDeviceSurfaceCapabilitiesKHR never reaches it.  Report the
+ * modes turned as well, and it looks for, and finds, a mode the shape of the
+ * screen the player sees. */
+static VKAPI_ATTR VkResult VKAPI_CALL
+layer_GetDisplayModePropertiesKHR(VkPhysicalDevice gpu, VkDisplayKHR display,
+                                  uint32_t *count,
+                                  VkDisplayModePropertiesKHR *props)
+{
+    struct instance_data *id;
+    PFN_vkGetDisplayModePropertiesKHR next = NULL;
+    int quarters = rotate_quarters();
+    VkResult r;
+    uint32_t i;
+
+    pthread_mutex_lock(&g_lock);
+    for (id = g_instances; id; id = id->next)
+        if (id->GetDisplayModePropertiesKHR) {
+            next = id->GetDisplayModePropertiesKHR;
+            break;
+        }
+    pthread_mutex_unlock(&g_lock);
+    if (!next)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    r = next(gpu, display, count, props);
+    if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || !props || !(quarters & 1))
+        return r;
+
+    for (i = 0; i < *count; i++) {
+        VkExtent2D e = props[i].parameters.visibleRegion;
+
+        props[i].parameters.visibleRegion.width = e.height;
+        props[i].parameters.visibleRegion.height = e.width;
+    }
+    return r;
+}
+
+/* ... and the surface it then asks for is described in those turned terms, so
+ * put the extent back the way the display wants it. */
+static VKAPI_ATTR VkResult VKAPI_CALL
+layer_CreateDisplayPlaneSurfaceKHR(VkInstance instance,
+                                   const VkDisplaySurfaceCreateInfoKHR *ci,
+                                   const VkAllocationCallbacks *alloc,
+                                   VkSurfaceKHR *out)
+{
+    struct instance_data *id;
+    PFN_vkCreateDisplayPlaneSurfaceKHR next = NULL;
+    VkDisplaySurfaceCreateInfoKHR ours;
+    int quarters = rotate_quarters();
+
+    pthread_mutex_lock(&g_lock);
+    for (id = g_instances; id; id = id->next)
+        if (id->CreateDisplayPlaneSurfaceKHR) {
+            next = id->CreateDisplayPlaneSurfaceKHR;
+            break;
+        }
+    pthread_mutex_unlock(&g_lock);
+    if (!next)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    ours = *ci;
+    if (quarters & 1) {
+        ours.imageExtent = turned(ci->imageExtent, quarters);
+        ov_log("vulkan: display surface asked for %ux%u, making it %ux%u",
+               ci->imageExtent.width, ci->imageExtent.height,
+               ours.imageExtent.width, ours.imageExtent.height);
+    }
+    return next(instance, &ours, alloc, out);
+}
+
+/* The application only ever sees the images it draws into, which for a rotated
+ * presentation are ours and not the swapchain's. */
+static VKAPI_ATTR VkResult VKAPI_CALL
+layer_GetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain,
+                            uint32_t *count, VkImage *images)
+{
+    struct swapchain_data *sd;
+    struct device_data *dd;
+    uint32_t i, n;
+
+    pthread_mutex_lock(&g_lock);
+    dd = find_device(device);
+    sd = find_swapchain(swapchain);
+    pthread_mutex_unlock(&g_lock);
+    if (!dd)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    if (!sd || !sd->rotated)
+        return dd->GetSwapchainImagesKHR(device, swapchain, count, images);
+
+    if (!images) {
+        *count = sd->owned_count;
+        return VK_SUCCESS;
+    }
+    n = *count < sd->owned_count ? *count : sd->owned_count;
+    for (i = 0; i < n; i++)
+        images[i] = sd->owned[i];
+    *count = n;
+    return n < sd->owned_count ? VK_INCOMPLETE : VK_SUCCESS;
+}
+
+/* One image the application draws into, in its own orientation. */
+static int make_owned_image(struct swapchain_data *sd, VkFormat format,
+                            VkImageUsageFlags usage, uint32_t index)
+{
+    struct device_data *dd = sd->dd;
+    VkImageCreateInfo ii;
+    VkMemoryRequirements req;
+    VkMemoryAllocateInfo mi;
+    int type;
+
+    memset(&ii, 0, sizeof(ii));
+    ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = format;
+    ii.extent.width = sd->app_extent.width;
+    ii.extent.height = sd->app_extent.height;
+    ii.extent.depth = 1;
+    ii.mipLevels = 1;
+    ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    /* What the application asked of a swapchain image, plus the sampling the
+     * rotate at present needs. */
+    ii.usage = usage | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    if (dd->vk.CreateImage(dd->device, &ii, NULL, &sd->owned[index]) != VK_SUCCESS)
+        return 0;
+    dd->vk.GetImageMemoryRequirements(dd->device, sd->owned[index], &req);
+    type = memory_type_for(dd, req.memoryTypeBits,
+                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (type < 0)
+        return 0;
+    memset(&mi, 0, sizeof(mi));
+    mi.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mi.allocationSize = req.size;
+    mi.memoryTypeIndex = (uint32_t)type;
+    if (dd->vk.AllocateMemory(dd->device, &mi, NULL, &sd->owned_mem[index])
+            != VK_SUCCESS)
+        return 0;
+    return dd->vk.BindImageMemory(dd->device, sd->owned[index],
+                                  sd->owned_mem[index], 0) == VK_SUCCESS;
+}
+
+static void free_owned_images(struct swapchain_data *sd)
+{
+    struct device_data *dd = sd->dd;
+    uint32_t i;
+
+    for (i = 0; i < sd->owned_count; i++) {
+        if (sd->owned[i])
+            dd->vk.DestroyImage(dd->device, sd->owned[i], NULL);
+        if (sd->owned_mem[i])
+            dd->vk.FreeMemory(dd->device, sd->owned_mem[i], NULL);
+        sd->owned[i] = VK_NULL_HANDLE;
+        sd->owned_mem[i] = VK_NULL_HANDLE;
+    }
+    sd->owned_count = 0;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL
 layer_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *ci,
                          const VkAllocationCallbacks *alloc,
@@ -344,7 +614,9 @@ layer_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *ci,
     struct device_data *dd;
     struct swapchain_data *sd;
     VkImage images[OV_VK_MAX_IMAGES];
+    VkSwapchainCreateInfoKHR real_ci;
     uint32_t count = OV_VK_MAX_IMAGES;
+    int quarters;
     VkResult r;
 
     pthread_mutex_lock(&g_lock);
@@ -353,7 +625,16 @@ layer_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *ci,
     if (!dd)
         return VK_ERROR_INITIALIZATION_FAILED;
 
-    r = dd->CreateSwapchainKHR(device, ci, alloc, out);
+    /* The application asked for the size we reported, which is the screen as
+     * the player sees it; the swapchain itself has to be the panel's own way
+     * round.  Only the extent differs -- everything else it asked for is what
+     * our own images are made with. */
+    quarters = rotate_quarters();
+    real_ci = *ci;
+    if (quarters & 1)
+        real_ci.imageExtent = turned(ci->imageExtent, quarters);
+
+    r = dd->CreateSwapchainKHR(device, &real_ci, alloc, out);
     if (r != VK_SUCCESS)
         return r;
 
@@ -362,7 +643,8 @@ layer_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *ci,
         return VK_SUCCESS;          /* no overlay, but the app is fine */
     sd->swapchain = *out;
     sd->dd = dd;
-    sd->extent = ci->imageExtent;
+    sd->extent = real_ci.imageExtent;
+    sd->app_extent = ci->imageExtent;
 
     /* Drawing onto the image means using it as a colour attachment; a
      * swapchain that was not asked for that is left alone. */
@@ -371,11 +653,37 @@ layer_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *ci,
     } else if (dd->GetSwapchainImagesKHR(device, *out, &count, images)
                == VK_SUCCESS && count > 0) {
         sd->renderer = ov_vk_create(device, &dd->vk, &dd->mem,
-                                    dd->queue_family, ci->imageFormat,
-                                    ci->imageExtent, images, count);
+                                    dd->queue_family, real_ci.imageFormat,
+                                    real_ci.imageExtent, images, count);
         ov_log("vulkan: swapchain %ux%u, %u images, overlay %s",
-               ci->imageExtent.width, ci->imageExtent.height, count,
+               real_ci.imageExtent.width, real_ci.imageExtent.height, count,
                sd->renderer ? "ready" : "unavailable");
+
+        if (quarters & 1) {
+            uint32_t i;
+
+            sd->owned_count = count;
+            for (i = 0; i < count; i++)
+                if (!make_owned_image(sd, ci->imageFormat, ci->imageUsage, i)) {
+                    ov_log("vulkan: cannot make a %ux%u image to draw into, "
+                           "presenting unrotated",
+                           sd->app_extent.width, sd->app_extent.height);
+                    free_owned_images(sd);
+                    break;
+                }
+            sd->rotated = sd->owned_count == count;
+            for (i = 0; sd->rotated && i < count; i++)
+                if (!ov_vk_set_source(sd->renderer, i, sd->owned[i])) {
+                    ov_log("vulkan: cannot sample image %u, presenting "
+                           "unrotated", i);
+                    sd->rotated = 0;
+                    free_owned_images(sd);
+                }
+            if (sd->rotated)
+                ov_log("vulkan: application draws %ux%u, panel is %ux%u",
+                       sd->app_extent.width, sd->app_extent.height,
+                       sd->extent.width, sd->extent.height);
+        }
     }
 
     pthread_mutex_lock(&g_lock);
@@ -403,6 +711,9 @@ layer_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
     pthread_mutex_unlock(&g_lock);
 
     if (sd) {
+        if (dd)
+            dd->vk.DeviceWaitIdle(dd->device);
+        free_owned_images(sd);
         ov_vk_destroy(sd->renderer);
         free(sd);
     }
@@ -464,6 +775,79 @@ layer_CmdCopyImage(VkCommandBuffer cmd, VkImage src, VkImageLayout src_layout,
 }
 
 
+/* $OV_VK_DEBUG_HOOKS only: which views the application builds a framebuffer
+ * from, and whether they are views of the images we handed it.  These hooks sit
+ * on paths a running game uses constantly, so they are never on by default. */
+static int debug_hooks(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+        on = getenv("OV_VK_DEBUG_HOOKS") != NULL;
+    return on;
+}
+
+static VkImageView g_our_views[OV_VK_MAX_IMAGES];
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+layer_CreateImageView(VkDevice device, const VkImageViewCreateInfo *ci,
+                      const VkAllocationCallbacks *alloc, VkImageView *out)
+{
+    struct device_data *dd;
+    struct swapchain_data *sd;
+    VkResult r;
+    int mine = -1;
+
+    pthread_mutex_lock(&g_lock);
+    dd = find_device(device);
+    for (sd = g_swapchains; sd && mine < 0; sd = sd->next) {
+        uint32_t i;
+
+        for (i = 0; i < sd->owned_count; i++)
+            if (sd->owned[i] == ci->image) {
+                mine = (int)i;
+                break;
+            }
+    }
+    pthread_mutex_unlock(&g_lock);
+    if (!dd)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    r = dd->vk.CreateImageView(device, ci, alloc, out);
+    if (r == VK_SUCCESS && mine >= 0 && mine < OV_VK_MAX_IMAGES) {
+        g_our_views[mine] = *out;
+        ov_log("vulkan: application made view %p of our image %d",
+               (void *)*out, mine);
+    }
+    return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+layer_CreateFramebuffer(VkDevice device, const VkFramebufferCreateInfo *ci,
+                        const VkAllocationCallbacks *alloc, VkFramebuffer *out)
+{
+    struct device_data *dd;
+    uint32_t a, i;
+
+    pthread_mutex_lock(&g_lock);
+    dd = find_device(device);
+    pthread_mutex_unlock(&g_lock);
+    if (!dd)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    for (a = 0; a < ci->attachmentCount; a++) {
+        int mine = -1;
+
+        for (i = 0; i < OV_VK_MAX_IMAGES; i++)
+            if (g_our_views[i] && g_our_views[i] == ci->pAttachments[a])
+                mine = (int)i;
+        ov_log("vulkan: framebuffer %ux%u attachment %u view %p -> %s",
+               ci->width, ci->height, a, (void *)ci->pAttachments[a],
+               mine >= 0 ? "OURS" : "not ours");
+    }
+    return dd->vk.CreateFramebuffer(device, ci, alloc, out);
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL
 layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pi)
 {
@@ -490,7 +874,11 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pi)
         return VK_ERROR_INITIALIZATION_FAILED;
 
     if (sd && sd->renderer && ov_frame_poll(&frame)) {
-        int rotation = ov_frame_rotation();
+        /* When we are the ones turning the frame, that angle governs the
+         * overlay too, so the clock and notifications sit the same way up as
+         * everything else; $OV_ROTATE stays for the boards where something
+         * below us does the turning. */
+        int rotation = sd->rotated ? rotate_quarters() : ov_frame_rotation();
         uint32_t index = pi->pImageIndices[0];
         VkImage target = VK_NULL_HANDLE;
 
@@ -509,7 +897,8 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pi)
         }
         build_drawlist(sd, &frame, rotation, &dl);
         sem = ov_vk_draw(sd->renderer, queue, index, target, &dl, rotation,
-                         pi->pWaitSemaphores, pi->waitSemaphoreCount);
+                         pi->pWaitSemaphores, pi->waitSemaphoreCount,
+                         sd->rotated);
     } else if (sd && sd->renderer && !g_told_idle) {
         g_told_idle = 1;
         ov_log("vulkan: present with nothing to draw");
@@ -542,7 +931,12 @@ layer_GetDeviceProcAddr(VkDevice device, const char *pName)
     HOOK(DestroyDevice);
     HOOK(CreateSwapchainKHR);
     HOOK(DestroySwapchainKHR);
+    HOOK(GetSwapchainImagesKHR);
     HOOK(QueuePresentKHR);
+    if (debug_hooks()) {
+        HOOK(CreateImageView);
+        HOOK(CreateFramebuffer);
+    }
     if (draw_mode() == OV_VK_INTO_SHADOW)
         HOOK(CmdCopyImage);
 
@@ -565,7 +959,13 @@ layer_GetInstanceProcAddr(VkInstance instance, const char *pName)
     HOOK(GetDeviceProcAddr);
     HOOK(CreateSwapchainKHR);
     HOOK(DestroySwapchainKHR);
+    HOOK(GetSwapchainImagesKHR);
     HOOK(QueuePresentKHR);
+    if (rotate_quarters() & 1) {
+        HOOK(GetPhysicalDeviceSurfaceCapabilitiesKHR);
+        HOOK(GetDisplayModePropertiesKHR);
+        HOOK(CreateDisplayPlaneSurfaceKHR);
+    }
     if (draw_mode() == OV_VK_INTO_SHADOW)
         HOOK(CmdCopyImage);
 
